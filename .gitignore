@@ -1,0 +1,13 @@
+node_modules/
+debug/
+.claude/
+
+# Credentials & secrets
+cards.json
+poke-491015-130855de8aa7.json
+
+# Output files
+results.json
+results.log
+scraper_output.log
+*.png

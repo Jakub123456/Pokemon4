@@ -1,0 +1,11 @@
+{
+  "username": "your_cardmarket_username",
+  "password": "your_cardmarket_password",
+  "maxSellers": 5,
+  "noDealLimit": 20,
+  "dealThreshold": 0.5,
+  "headless": false,
+  "expansions": [
+    { "expansion": "151", "idExpansion": 5402 }
+  ]
+}
