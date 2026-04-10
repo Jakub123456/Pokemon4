@@ -509,129 +509,142 @@ async function login(page, username, password) {
   console.log(`   Login complete! URL: ${page.url()}`);
 }
 
-// ─── Step 2-3: Search for a card via the Singles search form ─────────────────
+// ─── Step 2-3: Search for a card via the main search bar ────────────────────
 
-const SINGLES_URL = "https://www.cardmarket.com/en/Pokemon/Products/Singles";
+async function searchForCard(page, editionCode, pokemonId) {
+  const searchQuery = `${editionCode} ${pokemonId}`;
+  const exactPattern = `${editionCode}${pokemonId}`.toUpperCase(); // e.g. "MEW001"
+  const MAX_SEARCH_ATTEMPTS = 2;
 
-async function searchForCard(page, editionName, editionCode, pokemonId) {
-  const searchName = `${editionCode} ${pokemonId}`;
-  console.log(`   Navigating to Singles search page...`);
-  await safeGoto(page, SINGLES_URL);
-  await humanDelay(2000, 3000);
+  for (let attempt = 1; attempt <= MAX_SEARCH_ATTEMPTS; attempt++) {
+    console.log(`   Search attempt ${attempt}/${MAX_SEARCH_ATTEMPTS} for "${searchQuery}"...`);
 
-  // 2a. Select expansion in the Expansion dropdown
-  console.log(`   Selecting Expansion: "${editionName}"...`);
-  const expansionSet = await page.evaluate((editionName) => {
-    // Find the expansion <select> — typically name="idExpansion" or similar
-    const selects = document.querySelectorAll("select");
-    for (const sel of selects) {
-      const name = (sel.name || "").toLowerCase();
-      if (name.includes("expansion") || name.includes("idexpansion")) {
-        // Find the option whose text matches the edition name
+    // 2a. Select "Singles" in the main search bar category dropdown
+    console.log(`   Selecting "Singles" in search bar category...`);
+    const categorySet = await page.evaluate(() => {
+      // The main search bar has a category <select> — typically the first select in the top nav/search area
+      const selects = document.querySelectorAll("select");
+      for (const sel of selects) {
         for (const opt of sel.options) {
-          if (opt.text.trim() === editionName || opt.text.trim().includes(editionName)) {
+          if (opt.text.trim() === "Singles") {
             sel.value = opt.value;
-            // Trigger change event so the page reacts
             sel.dispatchEvent(new Event("change", { bubbles: true }));
-            return { success: true, selectedValue: opt.value, selectedText: opt.text.trim() };
+            return { success: true, selectedValue: opt.value };
           }
         }
-        // Return available options for debugging
-        const available = Array.from(sel.options).slice(0, 20).map(o => o.text.trim());
-        return { success: false, reason: `Expansion "${editionName}" not found in dropdown`, available };
       }
-    }
-    return { success: false, reason: "No expansion dropdown found on page" };
-  }, editionName);
-
-  if (expansionSet.success) {
-    console.log(`   Expansion selected: "${expansionSet.selectedText}" (value=${expansionSet.selectedValue})`);
-  } else {
-    console.log(`   Warning: ${expansionSet.reason}`);
-    if (expansionSet.available) {
-      console.log(`   First options: ${expansionSet.available.join(", ")}`);
-    }
-  }
-
-  // 2b. Type edition code + pokemon ID in the Name field (next to Expansion)
-  //     This is the SECOND input[name="searchString"] — the first is the top search bar.
-  console.log(`   Typing Name: "${searchName}"...`);
-  const allSearchInputs = await page.$$('input[name="searchString"]');
-  // The filter form's Name field is the second one (index 1); the first is the top bar
-  const nameInput = allSearchInputs.length > 1 ? allSearchInputs[1] : allSearchInputs[0];
-
-  // If both expansion dropdown AND name input are missing, the page is not real
-  // (Cloudflare soft block — page loads but content is blocked)
-  if (!expansionSet.success && !nameInput) {
-    throw new CloudflareBlockError("Page loaded but critical elements missing (no expansion dropdown, no name input) — likely Cloudflare soft block");
-  }
-
-  if (nameInput) {
-    await nameInput.click({ clickCount: 3 });
-    await nameInput.type(searchName, { delay: 50 });
-  } else {
-    console.log("   Warning: Name input field not found on page.");
-  }
-
-  // 2c. Submit the search form via the "Search" button in the filter form
-  console.log("   Submitting search...");
-  try {
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }),
-      page.evaluate(() => {
-        // The Search button is input[type="submit"][value="Search"] inside the filter form
-        // (not the top search bar form). Find it by looking for the one near the expansion select.
-        const expansionSelect = document.querySelector('select[name="idExpansion"]');
-        if (expansionSelect && expansionSelect.form) {
-          const btn = expansionSelect.form.querySelector('input[type="submit"][value="Search"]');
-          if (btn) { btn.click(); return; }
-          expansionSelect.form.submit();
-          return;
-        }
-        // Fallback: click any Search submit button
-        const btn = document.querySelector('input[type="submit"][value="Search"]');
-        if (btn) btn.click();
-      }),
-    ]);
-  } catch (err) {
-    console.log(`   Search submit error: ${err.message}`);
-  }
-
-  await humanDelay(2000, 3000);
-  console.log(`   Search results URL: ${page.url()}`);
-
-  // 2d. Pick the search result whose URL slug contains the exact code+ID (e.g. MEW001)
-  const exactPattern = `${editionCode}${pokemonId}`.toUpperCase(); // e.g. "MEW001"
-  const firstResult = await page.evaluate((exactPattern) => {
-    const seen = new Set();
-    const allResults = [];
-    for (const a of document.querySelectorAll('a[href*="/en/Pokemon/Products/Singles/"]')) {
-      const href = a.getAttribute("href") || "";
-      const basePath = href.split("?")[0];
-      const segments = basePath.split("/").filter(Boolean);
-      const singlesIdx = segments.indexOf("Singles");
-      // Card detail pages have at least 2 segments after "Singles": expansion + card slug
-      if (singlesIdx >= 0 && segments.length > singlesIdx + 2 && !seen.has(basePath)) {
-        seen.add(basePath);
-        let text = a.textContent.trim();
-        text = text.replace(/From\s+\d+[,.]\d+\s*€.*$/, "").trim();
-        if (text && text.length > 1) {
-          allResults.push({ href: basePath, name: text });
-        }
-      }
-    }
-    // Find the result whose URL slug ends with the exact code+ID (e.g. -MEW001 or MEW001)
-    const exact = allResults.find((r) => {
-      const slug = (r.href.split("/").pop() || "").toUpperCase();
-      // Slug format: CardName-MEW001 or CardName-V1-MEW001
-      return slug.endsWith(exactPattern);
+      return { success: false, reason: "No 'Singles' option found in any dropdown" };
     });
-    if (exact) return exact;
-    // Fallback: first result
-    return allResults.length > 0 ? allResults[0] : null;
-  }, exactPattern);
 
-  return firstResult;
+    if (categorySet.success) {
+      console.log(`   Category set to "Singles" (value=${categorySet.selectedValue})`);
+    } else {
+      console.log(`   Warning: ${categorySet.reason}`);
+      // If we can't even find a category dropdown, the page might be blocked
+      if (attempt >= MAX_SEARCH_ATTEMPTS) {
+        throw new CloudflareBlockError("Page loaded but search bar category dropdown missing — likely Cloudflare soft block");
+      }
+    }
+
+    // 2b. Type the search query into the main search bar input
+    console.log(`   Typing "${searchQuery}" in the main search bar...`);
+    const searchInput = await page.$('input[name="searchString"]');
+    if (!searchInput) {
+      if (attempt >= MAX_SEARCH_ATTEMPTS) {
+        throw new CloudflareBlockError("Main search bar input not found — likely Cloudflare soft block");
+      }
+      console.log(`   Search input not found. Waiting before retry...`);
+      await humanDelay(3000, 5000);
+      continue;
+    }
+
+    // Clear the field and type the query
+    await searchInput.click({ clickCount: 3 });
+    await searchInput.type(searchQuery, { delay: 80 });
+
+    // 2c. Wait for autocomplete results to appear
+    console.log(`   Waiting for autocomplete results...`);
+    await humanDelay(2000, 4000);
+
+    // Look for autocomplete dropdown results — these are typically links in a dropdown container
+    const matchResult = await page.evaluate((exactPattern) => {
+      // Cardmarket autocomplete results appear in a dropdown — look for links to Singles card pages
+      const candidates = [];
+      for (const a of document.querySelectorAll('a[href*="/en/Pokemon/Products/Singles/"]')) {
+        const href = a.getAttribute("href") || "";
+        const basePath = href.split("?")[0];
+        const segments = basePath.split("/").filter(Boolean);
+        const singlesIdx = segments.indexOf("Singles");
+        // Card detail pages have at least 2 segments after "Singles": expansion + card slug
+        if (singlesIdx >= 0 && segments.length > singlesIdx + 2) {
+          const text = a.textContent.trim();
+          if (text && text.length > 1) {
+            candidates.push({ href: basePath, name: text });
+          }
+        }
+      }
+
+      // Find the result whose URL slug ends with the exact code+ID (e.g. -MEW001 or MEW001)
+      const exact = candidates.find((r) => {
+        const slug = (r.href.split("/").pop() || "").toUpperCase();
+        return slug.endsWith(exactPattern);
+      });
+      if (exact) return { found: true, match: exact, candidateCount: candidates.length };
+
+      // Fallback: first candidate
+      if (candidates.length > 0) return { found: true, match: candidates[0], candidateCount: candidates.length };
+
+      return { found: false, candidateCount: 0 };
+    }, exactPattern);
+
+    if (matchResult.found) {
+      console.log(`   Found match in autocomplete (${matchResult.candidateCount} candidates): ${matchResult.match.name}`);
+      return matchResult.match;
+    }
+
+    // No autocomplete results — wait longer and try once more within this attempt
+    console.log(`   No autocomplete results yet. Waiting longer...`);
+    await humanDelay(3000, 5000);
+
+    const retryResult = await page.evaluate((exactPattern) => {
+      const candidates = [];
+      for (const a of document.querySelectorAll('a[href*="/en/Pokemon/Products/Singles/"]')) {
+        const href = a.getAttribute("href") || "";
+        const basePath = href.split("?")[0];
+        const segments = basePath.split("/").filter(Boolean);
+        const singlesIdx = segments.indexOf("Singles");
+        if (singlesIdx >= 0 && segments.length > singlesIdx + 2) {
+          const text = a.textContent.trim();
+          if (text && text.length > 1) {
+            candidates.push({ href: basePath, name: text });
+          }
+        }
+      }
+      const exact = candidates.find((r) => {
+        const slug = (r.href.split("/").pop() || "").toUpperCase();
+        return slug.endsWith(exactPattern);
+      });
+      if (exact) return { found: true, match: exact, candidateCount: candidates.length };
+      if (candidates.length > 0) return { found: true, match: candidates[0], candidateCount: candidates.length };
+      return { found: false, candidateCount: 0 };
+    }, exactPattern);
+
+    if (retryResult.found) {
+      console.log(`   Found match after extended wait (${retryResult.candidateCount} candidates): ${retryResult.match.name}`);
+      return retryResult.match;
+    }
+
+    if (attempt < MAX_SEARCH_ATTEMPTS) {
+      console.log(`   No results found. Clearing search and retrying...`);
+      // Clear the search input before retrying
+      await searchInput.click({ clickCount: 3 });
+      await page.keyboard.press("Backspace");
+      await humanDelay(2000, 3000);
+    }
+  }
+
+  console.log(`   Card "${searchQuery}" not found after ${MAX_SEARCH_ATTEMPTS} attempts. Skipping.`);
+  return null;
 }
 
 // ─── Step 5: Apply filters on card detail page ──────────────────────────────
@@ -1095,11 +1108,9 @@ async function main() {
 
       for (let blockRetry = 0; blockRetry < MAX_BLOCK_RETRIES; blockRetry++) {
         try {
-          // Step 2: Select Pokemon cards > Singles, search by Expansion + Name
-          console.log("\n2-3. Searching on Singles page...");
-          console.log(`     Expansion field: "${card.editionName}"`);
-          console.log(`     Name field: "${searchName}"`);
-          const match = await searchForCard(page, card.editionName, card.editionCode, card.pokemonId);
+          // Step 2: Search via main search bar (Singles category)
+          console.log(`\n2-3. Searching main search bar for "${searchName}"...`);
+          const match = await searchForCard(page, card.editionCode, card.pokemonId);
 
           if (!match) {
             consecutiveSkips++;
