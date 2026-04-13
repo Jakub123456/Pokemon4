@@ -6,6 +6,17 @@ const fs = require("fs");
 const path = require("path");
 const { google } = require("googleapis");
 
+// ─── Log to file + stdout ────────────────────────────────────────────────────
+const logStream = fs.createWriteStream(path.join(__dirname, "logs.txt"), { flags: "a" });
+const _origLog = console.log.bind(console);
+const _origError = console.error.bind(console);
+function writeLog(prefix, args) {
+  const line = `[${new Date().toISOString()}] ${prefix}${args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")}`;
+  logStream.write(line + "\n");
+}
+console.log = (...args) => { _origLog(...args); writeLog("", args); };
+console.error = (...args) => { _origError(...args); writeLog("[ERROR] ", args); };
+
 // Custom error for Cloudflare blocks — triggers browser restart
 class CloudflareBlockError extends Error {
   constructor(message) {
@@ -513,8 +524,121 @@ async function login(page, username, password) {
 
 async function searchForCard(page, editionCode, pokemonId) {
   const searchQuery = `${editionCode} ${pokemonId}`;
-  const exactPattern = `${editionCode}${pokemonId}`.toUpperCase(); // e.g. "MEW001"
+  // e.g. "ROS048" — padded form
+  const exactPattern = `${editionCode}${pokemonId}`.toUpperCase();
+  // e.g. "ROS48" — leading zeros stripped from the number
+  const strippedNum = String(parseInt(pokemonId, 10));
+  const strippedPattern = `${editionCode}${strippedNum}`.toUpperCase();
+  const strippedQuery = `${editionCode} ${strippedNum}`;
+
   const MAX_SEARCH_ATTEMPTS = 2;
+  const MAX_RESULT_PAGES = 15;
+
+  // Helper: scan current page for a Singles card link matching either pattern
+  const findExactMatch = () =>
+    page.evaluate((exactPattern, strippedPattern) => {
+      const candidates = [];
+      for (const a of document.querySelectorAll('a[href*="/en/Pokemon/Products/Singles/"]')) {
+        const href = a.getAttribute("href") || "";
+        const basePath = href.split("?")[0];
+        const segments = basePath.split("/").filter(Boolean);
+        const singlesIdx = segments.indexOf("Singles");
+        // Card detail pages have at least 2 segments after "Singles": expansion + card slug
+        if (singlesIdx >= 0 && segments.length > singlesIdx + 2) {
+          const text = a.textContent.trim();
+          if (text && text.length > 1) {
+            candidates.push({ href: basePath, name: text });
+          }
+        }
+      }
+      const slug = (c) => (c.href.split("/").pop() || "").toUpperCase();
+      const exact = candidates.find(
+        (r) => slug(r).endsWith(exactPattern) || slug(r).endsWith(strippedPattern)
+      );
+      return { exact: exact || null, candidateCount: candidates.length };
+    }, exactPattern, strippedPattern);
+
+  // Helper: type a query into the search bar (assumes Singles already selected)
+  async function typeQuery(searchInput, query) {
+    await searchInput.click({ clickCount: 3 });
+    await searchInput.type(query, { delay: 80 });
+  }
+
+  // Helper: navigate to the full results page by clicking "Show All" or pressing Enter
+  async function goToFullResults(searchInput) {
+    const showAllHref = await page.evaluate(() => {
+      for (const a of document.querySelectorAll("a")) {
+        const text = a.textContent.trim().toLowerCase();
+        if (text.includes("show all") || text.includes("all results") || text.includes("view all")) {
+          return a.getAttribute("href") || null;
+        }
+      }
+      return null;
+    });
+
+    if (showAllHref) {
+      console.log(`   Clicking "Show All" (${showAllHref})...`);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {}),
+        page.evaluate((href) => {
+          for (const a of document.querySelectorAll("a")) {
+            if (a.getAttribute("href") === href) { a.click(); return; }
+          }
+        }, showAllHref),
+      ]);
+    } else {
+      console.log(`   No "Show All" link found. Pressing Enter to submit search...`);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {}),
+        searchInput.press("Enter"),
+      ]);
+    }
+    await humanDelay(2000, 3000);
+    console.log(`   Full results page: ${page.url()}`);
+  }
+
+  // Helper: paginate through up to MAX_RESULT_PAGES pages looking for an exact match
+  async function scanAllResultPages() {
+    for (let pageNum = 1; pageNum <= MAX_RESULT_PAGES; pageNum++) {
+      const r = await findExactMatch();
+      if (r.exact) {
+        console.log(`   Found exact match on results page ${pageNum} (${r.candidateCount} candidates): ${r.exact.name}`);
+        return r.exact;
+      }
+      console.log(`   Page ${pageNum}: no match (${r.candidateCount} candidates). Looking for next page...`);
+
+      // Find "next page" link
+      const nextHref = await page.evaluate(() => {
+        // Cardmarket pagination: look for a link with aria-label containing "next", or text "›"/"»"/"Next"
+        for (const a of document.querySelectorAll("a")) {
+          const aria = (a.getAttribute("aria-label") || "").toLowerCase();
+          const text = a.textContent.trim();
+          if (
+            aria.includes("next") ||
+            text === "›" || text === "»" ||
+            text.toLowerCase() === "next"
+          ) {
+            const href = a.getAttribute("href");
+            if (href) return href;
+          }
+        }
+        return null;
+      });
+
+      if (!nextHref) {
+        console.log(`   No next page link found after page ${pageNum}. End of results.`);
+        break;
+      }
+
+      const nextUrl = nextHref.startsWith("http")
+        ? nextHref
+        : `https://www.cardmarket.com${nextHref}`;
+      console.log(`   Going to next page: ${nextUrl}`);
+      await safeGoto(page, nextUrl);
+      await humanDelay(1500, 2500);
+    }
+    return null;
+  }
 
   for (let attempt = 1; attempt <= MAX_SEARCH_ATTEMPTS; attempt++) {
     console.log(`   Search attempt ${attempt}/${MAX_SEARCH_ATTEMPTS} for "${searchQuery}"...`);
@@ -522,7 +646,6 @@ async function searchForCard(page, editionCode, pokemonId) {
     // 2a. Select "Singles" in the main search bar category dropdown
     console.log(`   Selecting "Singles" in search bar category...`);
     const categorySet = await page.evaluate(() => {
-      // The main search bar has a category <select> — typically the first select in the top nav/search area
       const selects = document.querySelectorAll("select");
       for (const sel of selects) {
         for (const opt of sel.options) {
@@ -540,14 +663,12 @@ async function searchForCard(page, editionCode, pokemonId) {
       console.log(`   Category set to "Singles" (value=${categorySet.selectedValue})`);
     } else {
       console.log(`   Warning: ${categorySet.reason}`);
-      // If we can't even find a category dropdown, the page might be blocked
       if (attempt >= MAX_SEARCH_ATTEMPTS) {
         throw new CloudflareBlockError("Page loaded but search bar category dropdown missing — likely Cloudflare soft block");
       }
     }
 
-    // 2b. Type the search query into the main search bar input
-    console.log(`   Typing "${searchQuery}" in the main search bar...`);
+    // 2b. Type the original padded query (e.g. "ROS 048")
     const searchInput = await page.$('input[name="searchString"]');
     if (!searchInput) {
       if (attempt >= MAX_SEARCH_ATTEMPTS) {
@@ -558,87 +679,59 @@ async function searchForCard(page, editionCode, pokemonId) {
       continue;
     }
 
-    // Clear the field and type the query
-    await searchInput.click({ clickCount: 3 });
-    await searchInput.type(searchQuery, { delay: 80 });
+    console.log(`   Typing "${searchQuery}" in the main search bar...`);
+    await typeQuery(searchInput, searchQuery);
 
-    // 2c. Wait for autocomplete results to appear
+    // 2c. Wait for autocomplete, check for exact match
     console.log(`   Waiting for autocomplete results...`);
     await humanDelay(2000, 4000);
 
-    // Look for autocomplete dropdown results — these are typically links in a dropdown container
-    const matchResult = await page.evaluate((exactPattern) => {
-      // Cardmarket autocomplete results appear in a dropdown — look for links to Singles card pages
-      const candidates = [];
-      for (const a of document.querySelectorAll('a[href*="/en/Pokemon/Products/Singles/"]')) {
-        const href = a.getAttribute("href") || "";
-        const basePath = href.split("?")[0];
-        const segments = basePath.split("/").filter(Boolean);
-        const singlesIdx = segments.indexOf("Singles");
-        // Card detail pages have at least 2 segments after "Singles": expansion + card slug
-        if (singlesIdx >= 0 && segments.length > singlesIdx + 2) {
-          const text = a.textContent.trim();
-          if (text && text.length > 1) {
-            candidates.push({ href: basePath, name: text });
-          }
-        }
-      }
-
-      // Find the result whose URL slug ends with the exact code+ID (e.g. -MEW001 or MEW001)
-      const exact = candidates.find((r) => {
-        const slug = (r.href.split("/").pop() || "").toUpperCase();
-        return slug.endsWith(exactPattern);
-      });
-      if (exact) return { found: true, match: exact, candidateCount: candidates.length };
-
-      // Fallback: first candidate
-      if (candidates.length > 0) return { found: true, match: candidates[0], candidateCount: candidates.length };
-
-      return { found: false, candidateCount: 0 };
-    }, exactPattern);
-
-    if (matchResult.found) {
-      console.log(`   Found match in autocomplete (${matchResult.candidateCount} candidates): ${matchResult.match.name}`);
-      return matchResult.match;
+    let result = await findExactMatch();
+    if (result.exact) {
+      console.log(`   Found exact match in autocomplete (${result.candidateCount} candidates): ${result.exact.name}`);
+      return result.exact;
     }
 
-    // No autocomplete results — wait longer and try once more within this attempt
-    console.log(`   No autocomplete results yet. Waiting longer...`);
+    // Extended wait and re-check
+    console.log(`   No exact match yet (${result.candidateCount} candidates). Waiting longer...`);
     await humanDelay(3000, 5000);
-
-    const retryResult = await page.evaluate((exactPattern) => {
-      const candidates = [];
-      for (const a of document.querySelectorAll('a[href*="/en/Pokemon/Products/Singles/"]')) {
-        const href = a.getAttribute("href") || "";
-        const basePath = href.split("?")[0];
-        const segments = basePath.split("/").filter(Boolean);
-        const singlesIdx = segments.indexOf("Singles");
-        if (singlesIdx >= 0 && segments.length > singlesIdx + 2) {
-          const text = a.textContent.trim();
-          if (text && text.length > 1) {
-            candidates.push({ href: basePath, name: text });
-          }
-        }
-      }
-      const exact = candidates.find((r) => {
-        const slug = (r.href.split("/").pop() || "").toUpperCase();
-        return slug.endsWith(exactPattern);
-      });
-      if (exact) return { found: true, match: exact, candidateCount: candidates.length };
-      if (candidates.length > 0) return { found: true, match: candidates[0], candidateCount: candidates.length };
-      return { found: false, candidateCount: 0 };
-    }, exactPattern);
-
-    if (retryResult.found) {
-      console.log(`   Found match after extended wait (${retryResult.candidateCount} candidates): ${retryResult.match.name}`);
-      return retryResult.match;
+    result = await findExactMatch();
+    if (result.exact) {
+      console.log(`   Found exact match after extended wait (${result.candidateCount} candidates): ${result.exact.name}`);
+      return result.exact;
     }
+
+    // 2d. Retry autocomplete with stripped query (e.g. "ROS 48") if different
+    if (strippedQuery !== searchQuery) {
+      console.log(`   No match for "${searchQuery}". Trying stripped query "${strippedQuery}"...`);
+      await typeQuery(searchInput, strippedQuery);
+      await humanDelay(2000, 4000);
+      result = await findExactMatch();
+      if (result.exact) {
+        console.log(`   Found exact match with stripped query (${result.candidateCount} candidates): ${result.exact.name}`);
+        return result.exact;
+      }
+      await humanDelay(2000, 3000);
+      result = await findExactMatch();
+      if (result.exact) {
+        console.log(`   Found exact match with stripped query (extended wait, ${result.candidateCount} candidates): ${result.exact.name}`);
+        return result.exact;
+      }
+      console.log(`   No match with stripped query either (${result.candidateCount} candidates). Going to full results...`);
+    } else {
+      console.log(`   No match in autocomplete (${result.candidateCount} candidates). Going to full results...`);
+    }
+
+    // 2e. Navigate to full results page and paginate
+    await goToFullResults(searchInput);
+    const match = await scanAllResultPages();
+    if (match) return match;
+
+    console.log(`   No exact match found across all result pages.`);
 
     if (attempt < MAX_SEARCH_ATTEMPTS) {
-      console.log(`   No results found. Clearing search and retrying...`);
-      // Clear the search input before retrying
-      await searchInput.click({ clickCount: 3 });
-      await page.keyboard.press("Backspace");
+      console.log(`   Retrying from main page...`);
+      await safeGoto(page, LOGIN_URL);
       await humanDelay(2000, 3000);
     }
   }
