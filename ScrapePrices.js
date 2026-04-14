@@ -536,14 +536,13 @@ async function searchForCard(page, editionCode, pokemonId) {
 
   // Helper: scan current page for a Singles card link matching either pattern
   const findExactMatch = () =>
-    page.evaluate((exactPattern, strippedPattern) => {
+    page.evaluate((exactPattern, strippedPattern, edCode, padNum, stripNum) => {
       const candidates = [];
       for (const a of document.querySelectorAll('a[href*="/en/Pokemon/Products/Singles/"]')) {
         const href = a.getAttribute("href") || "";
         const basePath = href.split("?")[0];
         const segments = basePath.split("/").filter(Boolean);
         const singlesIdx = segments.indexOf("Singles");
-        // Card detail pages have at least 2 segments after "Singles": expansion + card slug
         if (singlesIdx >= 0 && segments.length > singlesIdx + 2) {
           const text = a.textContent.trim();
           if (text && text.length > 1) {
@@ -551,12 +550,24 @@ async function searchForCard(page, editionCode, pokemonId) {
           }
         }
       }
+      // 1. Try matching by URL slug (works when Cardmarket includes set code in the slug)
       const slug = (c) => (c.href.split("/").pop() || "").toUpperCase();
-      const exact = candidates.find(
+      const slugMatch = candidates.find(
         (r) => slug(r).endsWith(exactPattern) || slug(r).endsWith(strippedPattern)
       );
-      return { exact: exact || null, candidateCount: candidates.length };
-    }, exactPattern, strippedPattern);
+      if (slugMatch) return { exact: slugMatch, candidateCount: candidates.length };
+
+      // 2. Fallback: match by card description text, e.g. "(EVS 029)" or "(EVS 29)"
+      //    Cardmarket always shows the set code in the link text even when the URL slug omits it.
+      const textPatterns = [
+        `(${edCode} ${padNum})`,
+        `(${edCode} ${stripNum})`,
+      ].map(p => p.toUpperCase());
+      const textMatch = candidates.find(
+        (r) => textPatterns.some(p => r.name.toUpperCase().includes(p))
+      );
+      return { exact: textMatch || null, candidateCount: candidates.length };
+    }, exactPattern, strippedPattern, editionCode.toUpperCase(), pokemonId, strippedNum);
 
   // Helper: type a query into the search bar (assumes Singles already selected)
   async function typeQuery(searchInput, query) {
@@ -1063,6 +1074,7 @@ async function main() {
   // Proxy rotation state
   let proxyCardCount = 0;
   let proxyRotateAfter = 0; // will be set on first launch
+  let currentUserDataDir = null;
 
   // Browser type rotation: alternate between system Chrome and Puppeteer Chromium
   let useSimpleBrowser = !!config.simpleBrowser;
@@ -1093,8 +1105,13 @@ async function main() {
     };
     if (!useSimpleBrowser) {
       launchOptions.executablePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-      launchOptions.userDataDir = "/tmp/cardmarket-chrome-profile";
+      if (useProxy) {
+        launchOptions.userDataDir = `/tmp/cardmarket-chrome-${sessionId}`;
+      } else {
+        launchOptions.userDataDir = "/tmp/cardmarket-chrome-profile";
+      }
     }
+    currentUserDataDir = launchOptions.userDataDir || null;
 
     console.log(`   [Session] Browser: ${useSimpleBrowser ? "Puppeteer Chromium" : "System Chrome"}`);
     const newBrowser = await puppeteer.launch(launchOptions);
@@ -1120,6 +1137,10 @@ async function main() {
     if (existingBrowser) {
       console.log("\n   [Session] Closing browser...");
       try { await existingBrowser.close(); } catch (e) { /* already closed */ }
+      if (currentUserDataDir && currentUserDataDir !== "/tmp/cardmarket-chrome-profile") {
+        try { fs.rmSync(currentUserDataDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
+      }
+      currentUserDataDir = null;
       await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
     }
 
